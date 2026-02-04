@@ -1,0 +1,163 @@
+# Default configuration for hierarchical forecast reconciliation
+# All paths are relative to project root
+
+# Data configuration
+data:
+  # M5 dataset paths
+  calendar_path: "data/m5/calendar.csv"
+  prices_path: "data/m5/sell_prices.csv"
+  sales_train_path: "data/m5/sales_train_evaluation.csv"
+  sales_test_path: "data/m5/sales_train_validation.csv"
+
+  # Preprocessing parameters
+  train_days: 1913  # Days in training set
+  validation_days: 28  # Days for validation
+  test_days: 28  # Days for testing
+  min_nonzero_ratio: 0.1  # Minimum ratio of non-zero values for series inclusion
+
+  # Aggregation levels for hierarchical reconciliation
+  aggregation_levels:
+    - "total"  # Level 1: Total
+    - "state"  # Level 2: State (CA, TX, WI)
+    - "store"  # Level 3: Store (10 stores)
+    - "cat"    # Level 4: Category (3 categories)
+    - "dept"   # Level 5: Department (7 departments)
+    - "state_cat"  # Level 6: State-Category
+    - "state_dept" # Level 7: State-Department
+    - "store_cat"  # Level 8: Store-Category
+    - "store_dept" # Level 9: Store-Department
+    - "item"       # Level 10: Item (3049 items)
+    - "item_store" # Level 11: Item-Store (bottom level)
+
+# Model configuration
+models:
+  # Statistical models
+  statistical:
+    ets:
+      seasonal_periods: 7
+      error: "add"
+      trend: "add"
+      seasonal: "add"
+      use_boxcox: true
+      remove_bias: true
+
+    arima:
+      seasonal_order: [1, 1, 1, 7]
+      maxiter: 50
+      method: "lbfgs"
+
+  # Deep learning models
+  deep_learning:
+    tft:
+      max_epochs: 100
+      learning_rate: 0.03
+      hidden_size: 16
+      attention_head_size: 4
+      dropout: 0.1
+      hidden_continuous_size: 8
+      output_size: 7
+      loss: "QuantileLoss"
+      quantiles: [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+
+    nbeats:
+      input_chunk_length: 28
+      output_chunk_length: 28
+      num_stacks: 30
+      num_blocks: 1
+      num_layers: 4
+      layer_widths: 512
+      expansion_coefficient_dim: 5
+      trend_polynomial_degree: 2
+      dropout: 0.0
+      activation: "ReLU"
+
+# Reconciliation configuration
+reconciliation:
+  method: "probabilistic_mint"  # Minimum trace with probabilistic constraints
+  weights: "wls"  # Weighted least squares
+  covariance_type: "sample"  # Sample covariance for weights
+  lambda_reg: 0.01  # Regularization parameter
+  preserve_uncertainty: true  # Maintain prediction intervals through reconciliation
+  coherence_penalty: 1.0  # Penalty for incoherent forecasts
+
+# Ensemble configuration
+ensemble:
+  weights:
+    ets: 0.25
+    arima: 0.25
+    tft: 0.35
+    nbeats: 0.15
+  combination_method: "weighted_average"
+  uncertainty_propagation: "bootstrap"  # Method for combining prediction intervals
+  n_bootstrap_samples: 1000
+
+# Training configuration
+training:
+  batch_size: 64
+  max_epochs: 200
+  early_stopping_patience: 20
+  learning_rate: 0.001
+  weight_decay: 1e-8
+  gradient_clip_val: 0.1
+
+  # Validation strategy
+  validation_split: 0.2
+  cross_validation_folds: 5
+
+  # Checkpointing
+  save_top_k: 3
+  monitor: "val_loss"
+  mode: "min"
+
+  # MLflow tracking
+  experiment_name: "hierarchical_forecast_reconciliation"
+  run_name: null  # Auto-generated if null
+  tracking_uri: "mlruns"
+
+# Evaluation configuration
+evaluation:
+  metrics:
+    - "WRMSSE"    # Weighted Root Mean Squared Scaled Error
+    - "MASE"      # Mean Absolute Scaled Error
+    - "sMAPE"     # symmetric Mean Absolute Percentage Error
+    - "MSIS"      # Mean Scaled Interval Score
+    - "CRPS"      # Continuous Ranked Probability Score
+    - "coverage_50"  # 50% prediction interval coverage
+    - "coverage_90"  # 90% prediction interval coverage
+    - "coverage_95"  # 95% prediction interval coverage
+    - "reconciliation_coherence"  # Coherence measure
+
+  # Significance testing
+  statistical_tests:
+    - "dm_test"   # Diebold-Mariano test
+    - "mcs_test"  # Model Confidence Set test
+
+  confidence_level: 0.05
+
+# Hyperparameter optimization
+optimization:
+  method: "optuna"
+  n_trials: 100
+  timeout: 7200  # 2 hours
+
+  # Parameters to optimize
+  search_space:
+    tft_learning_rate: [0.001, 0.1]
+    tft_hidden_size: [8, 64]
+    tft_dropout: [0.0, 0.3]
+    nbeats_num_stacks: [10, 50]
+    nbeats_layer_widths: [128, 1024]
+    reconciliation_lambda_reg: [0.001, 0.1]
+    ensemble_tft_weight: [0.1, 0.6]
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/training.log"
+  console: true
+
+# Reproducibility
+random_seed: 42
+torch_seed: 42
+numpy_seed: 42
