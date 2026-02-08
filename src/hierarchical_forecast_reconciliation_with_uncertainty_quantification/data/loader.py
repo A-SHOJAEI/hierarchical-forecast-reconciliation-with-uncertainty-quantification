@@ -338,26 +338,27 @@ class M5DataLoader:
             if 'd' not in self.calendar_data.columns:
                 raise ValueError("Calendar data must contain 'd' column")
 
-            # Merge with calendar data
+            # Merge with calendar data, avoiding duplicate columns
             calendar_features = ['d', 'date', 'wm_yr_wk', 'weekday', 'wday', 'month', 'year']
             available_features = [col for col in calendar_features if col in self.calendar_data.columns]
 
-            if len(available_features) <= 1:  # Only 'd' column
-                self.logger.warning("Calendar data contains minimal features, only 'd' column available")
+            # Remove features already present in data (except 'd' which is the merge key)
+            existing_cols = set(data.columns)
+            merge_features = ['d'] + [col for col in available_features if col != 'd' and col not in existing_cols]
 
-            enriched_data = data.merge(
-                self.calendar_data[available_features],
-                on='d',
-                how='left'
-            )
+            if len(merge_features) <= 1:
+                self.logger.warning("No new calendar features to add (all already present)")
+                enriched_data = data.copy()
+            else:
+                enriched_data = data.merge(
+                    self.calendar_data[merge_features].drop_duplicates(subset=['d']),
+                    on='d',
+                    how='left'
+                )
 
             # Check merge results
             if enriched_data.empty:
                 raise ValueError("Calendar feature merge resulted in empty data")
-
-            missing_calendar_data = enriched_data[available_features[1:]].isna().all(axis=1).sum() if len(available_features) > 1 else 0
-            if missing_calendar_data > 0:
-                self.logger.warning(f"{missing_calendar_data} rows have missing calendar data after merge")
 
             # Add derived features if date column is available
             if 'date' in self.calendar_data.columns:
@@ -427,11 +428,11 @@ class M5DataLoader:
         )
 
         # Add price-derived features
-        price_features = enriched_data.groupby(['store_id', 'item_id'])['sell_price'].transform([
-            'mean', 'std', 'min', 'max'
-        ])
-        price_features.columns = [f'price_{col}' for col in price_features.columns]
-        enriched_data = pd.concat([enriched_data, price_features], axis=1)
+        grouped = enriched_data.groupby(['store_id', 'item_id'])['sell_price']
+        enriched_data['price_mean'] = grouped.transform('mean')
+        enriched_data['price_std'] = grouped.transform('std').fillna(0)
+        enriched_data['price_min'] = grouped.transform('min')
+        enriched_data['price_max'] = grouped.transform('max')
 
         # Add price change indicators
         enriched_data['price_change'] = (

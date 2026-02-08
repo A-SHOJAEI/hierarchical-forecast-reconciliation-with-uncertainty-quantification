@@ -213,8 +213,12 @@ def main() -> None:
     except Exception as e:
         logger = logging.getLogger(__name__)
         logger.error(f"Training failed: {e}")
-        if args.log_level == "DEBUG":
-            logger.exception("Full traceback:")
+        try:
+            if args.log_level == "DEBUG":
+                logger.exception("Full traceback:")
+        except Exception:
+            import traceback
+            traceback.print_exc()
         sys.exit(1)
 
 
