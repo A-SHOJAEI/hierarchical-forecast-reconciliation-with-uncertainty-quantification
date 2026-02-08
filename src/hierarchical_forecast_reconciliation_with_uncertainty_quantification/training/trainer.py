@@ -5,21 +5,37 @@ This module provides a comprehensive training framework that supports model
 selection, hyperparameter optimization, and experiment tracking.
 """
 
+import copy
 import logging
 import time
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import mlflow
-import mlflow.pytorch
 import numpy as np
 import pandas as pd
-import optuna
-import torch
-from optuna.integration.mlflow import MLflowCallback
 from scipy import sparse
 from sklearn.model_selection import TimeSeriesSplit
+
+# Optional imports with graceful fallback
+try:
+    import mlflow
+    import mlflow.pytorch
+    HAS_MLFLOW = True
+except ImportError:
+    HAS_MLFLOW = False
+
+try:
+    import optuna
+    HAS_OPTUNA = True
+except ImportError:
+    HAS_OPTUNA = False
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 from ..data.loader import M5DataLoader, HierarchicalDataBuilder
 from ..data.preprocessing import M5Preprocessor, HierarchyBuilder
@@ -89,9 +105,14 @@ class HierarchicalForecastTrainer:
 
     def _setup_mlflow(self) -> None:
         """Set up MLflow experiment tracking."""
+        self.mlflow_enabled = False
+        if not HAS_MLFLOW:
+            self.logger.warning("MLflow not installed, tracking disabled")
+            return
         try:
             mlflow.set_tracking_uri(self.config.get('training', {}).get('tracking_uri', 'mlruns'))
             mlflow.set_experiment(self.experiment_name)
+            self.mlflow_enabled = True
             self.logger.info(f"MLflow experiment: {self.experiment_name}")
         except Exception as e:
             self.logger.warning(f"MLflow setup failed: {e}")
@@ -117,40 +138,68 @@ class HierarchicalForecastTrainer:
         self.logger.info("Starting hierarchical forecast training pipeline...")
 
         try:
-            with mlflow.start_run(run_name=self.config.get('training', {}).get('run_name')):
-                # Log configuration
-                mlflow.log_params(self._flatten_config(self.config))
-
-                # Load and prepare data
-                train_data, val_data, test_data = self._prepare_data()
-
-                # Build hierarchical structure
-                hierarchy_data = self._build_hierarchy(train_data)
-
-                if optimize_hyperparameters:
-                    # Hyperparameter optimization
-                    best_params = self._optimize_hyperparameters(
-                        train_data, val_data, hierarchy_data, n_trials
+            # Start MLflow run if available
+            mlflow_context = None
+            if self.mlflow_enabled:
+                try:
+                    mlflow_context = mlflow.start_run(
+                        run_name=self.config.get('training', {}).get('run_name')
                     )
-                    self._update_config_with_best_params(best_params)
+                    mlflow_context.__enter__()
+                    # Log configuration (flattened)
+                    try:
+                        flat_config = self._flatten_config(self.config)
+                        mlflow.log_params(flat_config)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to log params to MLflow: {e}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to start MLflow run: {e}")
+                    mlflow_context = None
 
-                # Train final model
-                model = self._train_model(train_data, hierarchy_data)
+            # Load and prepare data
+            train_data, val_data, test_data = self._prepare_data()
 
-                # Validate model
-                val_metrics = self._validate_model(model, val_data, test_data)
+            # Build hierarchical structure
+            hierarchy_data = self._build_hierarchy(train_data)
 
-                # Log results
-                self._log_training_results(model, val_metrics)
+            if optimize_hyperparameters and HAS_OPTUNA:
+                # Hyperparameter optimization
+                best_params = self._optimize_hyperparameters(
+                    train_data, val_data, hierarchy_data, n_trials
+                )
+                self._update_config_with_best_params(best_params)
 
-                self.best_model = model
-                self.is_fitted = True
+            # Train final model
+            model = self._train_model(train_data, hierarchy_data)
 
-                self.logger.info("Training pipeline completed successfully")
-                return model
+            # Validate model
+            val_metrics = self._validate_model(model, val_data, test_data)
+
+            # Log results
+            self._log_training_results(model, val_metrics)
+
+            self.best_model = model
+            self.is_fitted = True
+
+            self.logger.info("Training pipeline completed successfully")
+
+            # End MLflow run
+            if mlflow_context is not None:
+                try:
+                    mlflow_context.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+            return model
 
         except Exception as e:
             self.logger.error(f"Training pipeline failed: {e}")
+            # End MLflow run on error
+            if self.mlflow_enabled:
+                try:
+                    mlflow.end_run()
+                except Exception:
+                    pass
             raise
 
     def _prepare_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -229,7 +278,11 @@ class HierarchicalForecastTrainer:
         self.logger.info(f"Model training completed in {training_time:.2f} seconds")
 
         # Log training time
-        mlflow.log_metric("training_time_seconds", training_time)
+        if self.mlflow_enabled:
+            try:
+                mlflow.log_metric("training_time_seconds", training_time)
+            except Exception as e:
+                self.logger.warning(f"Failed to log training time to MLflow: {e}")
 
         return model
 
@@ -243,7 +296,11 @@ class HierarchicalForecastTrainer:
         self.logger.info("Validating model performance...")
 
         # Generate predictions for validation period
-        val_horizon = len(val_data['date'].unique())
+        if 'date' in val_data.columns:
+            val_horizon = len(val_data['date'].unique())
+        else:
+            val_horizon = 28  # default
+
         val_predictions = model.predict(
             horizon=val_horizon,
             return_intervals=True,
@@ -255,13 +312,18 @@ class HierarchicalForecastTrainer:
             predictions=val_predictions['forecasts'],
             actuals=self._extract_actuals(val_data),
             intervals=val_predictions,
-            hierarchy_data={},  # Could pass hierarchy data for level-wise metrics
+            hierarchy_data={},
             confidence_levels=[0.1, 0.05]
         )
 
-        # Log metrics
-        for metric_name, value in val_metrics.items():
-            mlflow.log_metric(f"val_{metric_name}", value)
+        # Log metrics to MLflow
+        if self.mlflow_enabled:
+            try:
+                for metric_name, value in val_metrics.items():
+                    if isinstance(value, (int, float)) and np.isfinite(value):
+                        mlflow.log_metric(f"val_{metric_name}", value)
+            except Exception as e:
+                self.logger.warning(f"Failed to log metrics to MLflow: {e}")
 
         self.logger.info(f"Validation metrics: {val_metrics}")
         return val_metrics
@@ -285,22 +347,29 @@ class HierarchicalForecastTrainer:
             study_name=f"{self.experiment_name}_optimization"
         )
 
-        # Add MLflow callback
-        mlflow_callback = MLflowCallback(
-            tracking_uri=mlflow.get_tracking_uri(),
-            metric_name="val_loss"
-        )
+        # Add MLflow callback if available
+        mlflow_callback = None
+        if self.mlflow_enabled:
+            try:
+                from optuna.integration.mlflow import MLflowCallback
+                mlflow_callback = MLflowCallback(
+                    tracking_uri=mlflow.get_tracking_uri(),
+                    metric_name="val_loss"
+                )
+            except Exception as e:
+                self.logger.warning(f"MLflow callback not available: {e}")
 
         # Define objective function
         def objective(trial: optuna.Trial) -> float:
             return self._objective_function(trial, train_data, val_data, hierarchy_data)
 
         # Run optimization
+        callbacks = [mlflow_callback] if mlflow_callback is not None else []
         study.optimize(
             objective,
             n_trials=n_trials,
             timeout=self.config.get('optimization', {}).get('timeout'),
-            callbacks=[mlflow_callback]
+            callbacks=callbacks
         )
 
         best_params = study.best_params
@@ -308,9 +377,13 @@ class HierarchicalForecastTrainer:
         self.logger.info(f"Best validation score: {study.best_value}")
 
         # Log optimization results
-        mlflow.log_params(best_params)
-        mlflow.log_metric("best_validation_score", study.best_value)
-        mlflow.log_metric("optimization_trials", len(study.trials))
+        if self.mlflow_enabled:
+            try:
+                mlflow.log_params({k: str(v) for k, v in best_params.items()})
+                mlflow.log_metric("best_validation_score", study.best_value)
+                mlflow.log_metric("optimization_trials", len(study.trials))
+            except Exception as e:
+                self.logger.warning(f"Failed to log optimization results to MLflow: {e}")
 
         return best_params
 
@@ -401,7 +474,7 @@ class HierarchicalForecastTrainer:
 
     def _update_config_with_trial_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Update configuration with trial parameters."""
-        trial_config = self.config.copy()
+        trial_config = copy.deepcopy(self.config)
 
         # Update TFT parameters
         if 'tft_learning_rate' in params:
@@ -450,15 +523,12 @@ class HierarchicalForecastTrainer:
         metrics: Dict[str, float]
     ) -> None:
         """Log training results to MLflow."""
-        # Log model
-        try:
-            mlflow.pytorch.log_model(
-                pytorch_model=model,
-                artifact_path="model",
-                registered_model_name=f"{self.experiment_name}_model"
-            )
-        except Exception as e:
-            self.logger.warning(f"Failed to log model to MLflow: {e}")
+        if self.mlflow_enabled:
+            try:
+                # Note: model is not a PyTorch model, skip pytorch logging
+                self.logger.info("Logging training results...")
+            except Exception as e:
+                self.logger.warning(f"Failed to log model to MLflow: {e}")
 
         # Log artifacts
         self._save_and_log_artifacts(model, metrics)
@@ -481,20 +551,36 @@ class HierarchicalForecastTrainer:
             config_path = artifacts_dir / "config.json"
             with open(config_path, 'w') as f:
                 json.dump(self.config, f, indent=2, default=str)
-            mlflow.log_artifact(str(config_path))
 
-            # Save metrics
+            # Save metrics (convert numpy types to native Python)
+            clean_metrics = {}
+            for k, v in metrics.items():
+                if isinstance(v, (np.integer,)):
+                    clean_metrics[k] = int(v)
+                elif isinstance(v, (np.floating,)):
+                    clean_metrics[k] = float(v)
+                else:
+                    clean_metrics[k] = v
+
             metrics_path = artifacts_dir / "metrics.json"
             with open(metrics_path, 'w') as f:
-                json.dump(metrics, f, indent=2)
-            mlflow.log_artifact(str(metrics_path))
+                json.dump(clean_metrics, f, indent=2)
 
             # Save aggregation matrix
             if self.aggregation_matrix is not None:
                 matrix_path = artifacts_dir / "aggregation_matrix.pkl"
                 with open(matrix_path, 'wb') as f:
                     pickle.dump(self.aggregation_matrix, f)
-                mlflow.log_artifact(str(matrix_path))
+
+            # Log to MLflow if available
+            if self.mlflow_enabled:
+                try:
+                    mlflow.log_artifact(str(config_path))
+                    mlflow.log_artifact(str(metrics_path))
+                    if self.aggregation_matrix is not None:
+                        mlflow.log_artifact(str(matrix_path))
+                except Exception as e:
+                    self.logger.warning(f"Failed to log artifacts to MLflow: {e}")
 
             self.logger.info("Artifacts saved and logged successfully")
 
@@ -508,8 +594,13 @@ class HierarchicalForecastTrainer:
             new_key = f"{parent_key}.{k}" if parent_key else k
             if isinstance(v, dict):
                 items.extend(self._flatten_config(v, new_key).items())
+            elif isinstance(v, list):
+                # MLflow params must be strings; convert lists
+                items.append((new_key, str(v)[:250]))
+            elif v is None:
+                items.append((new_key, "null"))
             else:
-                items.append((new_key, v))
+                items.append((new_key, str(v)[:250]))
         return dict(items)
 
     def cross_validate(

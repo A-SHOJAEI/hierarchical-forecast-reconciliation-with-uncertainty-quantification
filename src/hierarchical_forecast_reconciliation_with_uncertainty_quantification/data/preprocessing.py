@@ -172,10 +172,14 @@ class M5Preprocessor:
 
         # Forward fill for time series continuity
         data = data.sort_values(['id', 'date'])
-        data['sales'] = data.groupby('id')['sales'].fillna(method='ffill')
+        data['sales'] = data.groupby('id')['sales'].transform(
+            lambda x: x.ffill()
+        )
 
         # Backward fill for remaining missing values
-        data['sales'] = data.groupby('id')['sales'].fillna(method='bfill')
+        data['sales'] = data.groupby('id')['sales'].transform(
+            lambda x: x.bfill()
+        )
 
         # Fill remaining with 0
         data['sales'] = data['sales'].fillna(0)
@@ -190,7 +194,8 @@ class M5Preprocessor:
         numerical_cols = data.select_dtypes(include=[np.number]).columns
         for col in numerical_cols:
             if col != 'sales':
-                data[col] = data[col].fillna(data[col].median())
+                median_val = data[col].median()
+                data[col] = data[col].fillna(median_val if pd.notna(median_val) else 0)
 
         return data
 
@@ -264,17 +269,20 @@ class M5Preprocessor:
         # Seasonal features from date
         if 'date' in data.columns:
             data['date'] = pd.to_datetime(data['date'])
-            data['day_of_week'] = data['date'].dt.dayofweek
-            data['day_of_month'] = data['date'].dt.day
-            data['week_of_year'] = data['date'].dt.isocalendar().week
-            data['month'] = data['date'].dt.month
-            data['quarter'] = data['date'].dt.quarter
+            data['day_of_week'] = data['date'].dt.dayofweek.astype(int)
+            data['day_of_month'] = data['date'].dt.day.astype(int)
+            data['week_of_year'] = data['date'].dt.isocalendar().week.astype(int).values
+            data['month'] = data['date'].dt.month.astype(int)
+            data['quarter'] = data['date'].dt.quarter.astype(int)
 
         return data
 
     def _fit_transform_scaling(self, data: pd.DataFrame, target_col: str) -> pd.DataFrame:
         """Fit scalers and transform numerical features."""
         self.logger.info(f"Fitting {self.scaling_method} scaling...")
+
+        # Replace inf values with NaN first, then fill
+        data = data.replace([np.inf, -np.inf], np.nan)
 
         # Select numerical columns for scaling
         numerical_cols = data.select_dtypes(include=[np.number]).columns.tolist()
@@ -285,6 +293,9 @@ class M5Preprocessor:
 
         # Fit and transform each column
         for col in numerical_cols:
+            # Replace remaining NaN with 0 for this column
+            data[col] = data[col].fillna(0)
+
             if self.scaling_method == "standard":
                 scaler = StandardScaler()
             elif self.scaling_method == "minmax":
@@ -292,12 +303,17 @@ class M5Preprocessor:
             else:
                 continue
 
-            # Fit on non-missing values
-            valid_mask = ~data[col].isna()
-            if valid_mask.sum() > 0:
-                scaler.fit(data.loc[valid_mask, [col]])
+            # Check for constant columns
+            col_std = data[col].std()
+            if col_std == 0 or np.isnan(col_std):
+                continue
+
+            try:
+                scaler.fit(data[[col]])
                 data[col] = scaler.transform(data[[col]]).flatten()
                 self.scalers[col] = scaler
+            except Exception as e:
+                self.logger.warning(f"Scaling failed for column {col}: {e}")
 
         return data
 
@@ -331,29 +347,40 @@ class M5Preprocessor:
         """
         self.logger.info("Creating train/validation/test splits...")
 
+        # Ensure date column is datetime
+        data = data.copy()
+        data['date'] = pd.to_datetime(data['date'])
+
         # Sort by date
         data = data.sort_values('date')
         unique_dates = sorted(data['date'].unique())
 
-        # Calculate split points
+        total_needed = train_days + validation_days + test_days
+        available = len(unique_dates)
+
+        if available < total_needed:
+            # Adjust splits proportionally
+            ratio = available / total_needed
+            train_days = max(1, int(train_days * ratio))
+            validation_days = max(1, int(validation_days * ratio))
+            test_days = max(1, min(test_days, available - train_days - validation_days))
+            self.logger.warning(
+                f"Adjusted splits: train={train_days}, val={validation_days}, "
+                f"test={test_days} (available={available})"
+            )
+
         train_end_idx = train_days
         val_end_idx = train_days + validation_days
 
-        if len(unique_dates) < val_end_idx + test_days:
-            raise ValueError(
-                f"Insufficient data: need {val_end_idx + test_days} days, "
-                f"but only have {len(unique_dates)} days"
-            )
-
         # Split dates
-        train_dates = unique_dates[:train_end_idx]
-        val_dates = unique_dates[train_end_idx:val_end_idx]
-        test_dates = unique_dates[val_end_idx:val_end_idx + test_days]
+        train_dates = set(unique_dates[:train_end_idx])
+        val_dates = set(unique_dates[train_end_idx:val_end_idx])
+        test_dates = set(unique_dates[val_end_idx:val_end_idx + test_days])
 
         # Create splits
-        train_data = data[data['date'].isin(train_dates)]
-        val_data = data[data['date'].isin(val_dates)]
-        test_data = data[data['date'].isin(test_dates)]
+        train_data = data[data['date'].isin(train_dates)].copy()
+        val_data = data[data['date'].isin(val_dates)].copy()
+        test_data = data[data['date'].isin(test_dates)].copy()
 
         self.logger.info(f"Train split: {train_data.shape} ({len(train_dates)} days)")
         self.logger.info(f"Validation split: {val_data.shape} ({len(val_dates)} days)")
@@ -488,43 +515,68 @@ class HierarchyBuilder:
             List of contributing bottom-level series IDs.
         """
         if level == "total":
-            return bottom_data['id'].tolist()
+            return bottom_data['id'].unique().tolist()
         elif level == "state":
-            return bottom_data[bottom_data['state_id'] == aggregate_id]['id'].tolist()
+            if 'state_id' in bottom_data.columns:
+                return bottom_data[bottom_data['state_id'] == aggregate_id]['id'].unique().tolist()
+            return []
         elif level == "store":
-            return bottom_data[bottom_data['store_id'] == aggregate_id]['id'].tolist()
+            if 'store_id' in bottom_data.columns:
+                return bottom_data[bottom_data['store_id'] == aggregate_id]['id'].unique().tolist()
+            return []
         elif level == "cat":
-            return bottom_data[bottom_data['cat_id'] == aggregate_id]['id'].tolist()
+            if 'cat_id' in bottom_data.columns:
+                return bottom_data[bottom_data['cat_id'] == aggregate_id]['id'].unique().tolist()
+            return []
         elif level == "dept":
-            return bottom_data[bottom_data['dept_id'] == aggregate_id]['id'].tolist()
+            if 'dept_id' in bottom_data.columns:
+                return bottom_data[bottom_data['dept_id'] == aggregate_id]['id'].unique().tolist()
+            return []
         elif level == "state_cat":
-            state_id, cat_id = aggregate_id.split('_', 1)
-            return bottom_data[
-                (bottom_data['state_id'] == state_id) &
-                (bottom_data['cat_id'] == cat_id)
-            ]['id'].tolist()
+            # aggregate_id format: "CA_HOBBIES" - state is first part before underscore
+            parts = aggregate_id.split('_', 1)
+            if len(parts) == 2 and 'state_id' in bottom_data.columns and 'cat_id' in bottom_data.columns:
+                return bottom_data[
+                    (bottom_data['state_id'] == parts[0]) &
+                    (bottom_data['cat_id'] == parts[1])
+                ]['id'].unique().tolist()
+            return []
         elif level == "state_dept":
-            state_id, dept_id = aggregate_id.split('_', 1)
-            return bottom_data[
-                (bottom_data['state_id'] == state_id) &
-                (bottom_data['dept_id'] == dept_id)
-            ]['id'].tolist()
+            parts = aggregate_id.split('_', 1)
+            if len(parts) == 2 and 'state_id' in bottom_data.columns and 'dept_id' in bottom_data.columns:
+                return bottom_data[
+                    (bottom_data['state_id'] == parts[0]) &
+                    (bottom_data['dept_id'] == parts[1])
+                ]['id'].unique().tolist()
+            return []
         elif level == "store_cat":
-            store_id, cat_id = aggregate_id.split('_', 1)
-            return bottom_data[
-                (bottom_data['store_id'] == store_id) &
-                (bottom_data['cat_id'] == cat_id)
-            ]['id'].tolist()
+            # aggregate_id format: "CA_1_HOBBIES" - store is "XX_N", cat is the rest
+            parts = aggregate_id.split('_', 2)
+            if len(parts) >= 3 and 'store_id' in bottom_data.columns and 'cat_id' in bottom_data.columns:
+                store_id = f"{parts[0]}_{parts[1]}"
+                cat_id = parts[2]
+                return bottom_data[
+                    (bottom_data['store_id'] == store_id) &
+                    (bottom_data['cat_id'] == cat_id)
+                ]['id'].unique().tolist()
+            return []
         elif level == "store_dept":
-            store_id, dept_id = aggregate_id.split('_', 1)
-            return bottom_data[
-                (bottom_data['store_id'] == store_id) &
-                (bottom_data['dept_id'] == dept_id)
-            ]['id'].tolist()
+            parts = aggregate_id.split('_', 2)
+            if len(parts) >= 3 and 'store_id' in bottom_data.columns and 'dept_id' in bottom_data.columns:
+                store_id = f"{parts[0]}_{parts[1]}"
+                dept_id = '_'.join(parts[2:])
+                return bottom_data[
+                    (bottom_data['store_id'] == store_id) &
+                    (bottom_data['dept_id'] == dept_id)
+                ]['id'].unique().tolist()
+            return []
         elif level == "item":
-            return bottom_data[bottom_data['item_id'] == aggregate_id]['id'].tolist()
+            if 'item_id' in bottom_data.columns:
+                return bottom_data[bottom_data['item_id'] == aggregate_id]['id'].unique().tolist()
+            return []
         else:
-            raise ValueError(f"Unknown hierarchy level: {level}")
+            self.logger.warning(f"Unknown hierarchy level: {level}")
+            return []
 
     def get_hierarchy_structure(
         self,

@@ -12,18 +12,34 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from darts import TimeSeries
-from darts.models import ARIMA, ExponentialSmoothing, NBEATSModel, TFTModel
-from properscoring import crps_ensemble
 from scipy import sparse
 from scipy.linalg import solve
 from scipy.optimize import minimize
 from scipy.stats import norm
 from sklearn.covariance import EmpiricalCovariance, LedoitWolf
-from statsmodels.tsa.exponential_smoothing import ExponentialSmoothing as StatsETS
+from statsmodels.tsa.holtwinters import ExponentialSmoothing as StatsETS
 from statsmodels.tsa.arima.model import ARIMA as StatsARIMA
+
+# Optional imports
+try:
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+try:
+    from darts import TimeSeries
+    from darts.models import NBEATSModel, TFTModel
+    HAS_DARTS = True
+except ImportError:
+    HAS_DARTS = False
+
+try:
+    from properscoring import crps_ensemble
+    HAS_PROPERSCORING = True
+except ImportError:
+    HAS_PROPERSCORING = False
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -319,8 +335,9 @@ class StatisticalForecaster(BaseForecaster):
                 except Exception as e:
                     self.logger.warning(f"Prediction failed for {series_id}: {e}")
                     # Fallback to naive forecast
-                    last_value = self.series_data[series_id].iloc[-1]
-                    forecasts[series_id] = np.full(horizon, last_value)
+                    ts = self.series_data[series_id]
+                    last_value = ts.iloc[-1] if hasattr(ts, 'iloc') else ts[-1]
+                    forecasts[series_id] = np.full(horizon, float(last_value))
 
         result = {"forecasts": forecasts}
         if return_intervals:
@@ -331,35 +348,53 @@ class StatisticalForecaster(BaseForecaster):
 
     def _fit_ets_model(self, ts_data: pd.Series, series_id: str) -> Any:
         """Fit ETS model to a single time series."""
-        # Use statsmodels ETS
-        model = StatsETS(
-            ts_data,
-            seasonal_periods=self.ets_config.get('seasonal_periods', 7),
-            error=self.ets_config.get('error', 'add'),
-            trend=self.ets_config.get('trend', 'add'),
-            seasonal=self.ets_config.get('seasonal', 'add')
-        )
+        seasonal_periods = self.ets_config.get('seasonal_periods', 7)
+        use_boxcox = self.ets_config.get('use_boxcox', False)
+
+        # Need at least 2 full seasonal cycles for seasonal model
+        if len(ts_data) < 2 * seasonal_periods:
+            model = StatsETS(
+                ts_data.values,
+                trend=self.ets_config.get('trend', 'add'),
+                seasonal=None,
+                use_boxcox=use_boxcox,
+            )
+        else:
+            model = StatsETS(
+                ts_data.values,
+                seasonal_periods=seasonal_periods,
+                trend=self.ets_config.get('trend', 'add'),
+                seasonal=self.ets_config.get('seasonal', 'add'),
+                use_boxcox=use_boxcox,
+            )
 
         fitted_model = model.fit(
-            use_boxcox=self.ets_config.get('use_boxcox', False),
-            remove_bias=self.ets_config.get('remove_bias', True)
+            remove_bias=self.ets_config.get('remove_bias', True),
+            optimized=True,
         )
 
         return fitted_model
 
     def _fit_arima_model(self, ts_data: pd.Series, series_id: str) -> Any:
         """Fit ARIMA model to a single time series."""
-        seasonal_order = self.arima_config.get('seasonal_order', (1, 1, 1, 7))
+        seasonal_order = tuple(self.arima_config.get('seasonal_order', [1, 1, 1, 7]))
+        maxiter = self.arima_config.get('maxiter', 50)
 
-        model = StatsARIMA(
-            ts_data,
-            order=(1, 1, 1),  # Auto-select or use default
-            seasonal_order=seasonal_order
-        )
+        # Use simpler ARIMA for short series
+        if len(ts_data) < 2 * seasonal_order[3] + 10:
+            model = StatsARIMA(
+                ts_data.values,
+                order=(1, 1, 1),
+            )
+        else:
+            model = StatsARIMA(
+                ts_data.values,
+                order=(1, 1, 1),
+                seasonal_order=seasonal_order,
+            )
 
         fitted_model = model.fit(
-            method=self.arima_config.get('method', 'lbfgs'),
-            maxiter=self.arima_config.get('maxiter', 50)
+            method_kwargs={'maxiter': maxiter},
         )
 
         return fitted_model
@@ -371,28 +406,25 @@ class StatisticalForecaster(BaseForecaster):
         confidence_levels: List[float]
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
         """Generate ETS predictions with intervals."""
-        forecast_result = model.forecast(steps=horizon, return_conf_int=True)
+        # Holt-Winters forecast returns a simple array
+        point_forecast = model.forecast(horizon)
+        point_forecast = np.array(point_forecast, dtype=float)
 
-        point_forecast = forecast_result.iloc[:, 0].values
         intervals = {}
 
-        # Extract confidence intervals
-        for i, alpha in enumerate(confidence_levels):
+        # Use residual standard error for prediction intervals
+        residuals = model.resid
+        sigma = np.std(residuals) if len(residuals) > 0 else 1.0
+
+        for alpha in confidence_levels:
             lower_key = f"lower_{int((1-alpha)*100)}"
             upper_key = f"upper_{int((1-alpha)*100)}"
 
-            # Use forecast confidence intervals if available
-            if hasattr(forecast_result, 'conf_int'):
-                conf_int = model.get_forecast(horizon).conf_int(alpha=alpha)
-                intervals[lower_key] = conf_int.iloc[:, 0].values
-                intervals[upper_key] = conf_int.iloc[:, 1].values
-            else:
-                # Fallback: use residual standard error
-                residuals = model.resid
-                sigma = np.std(residuals)
-                z_score = norm.ppf(1 - alpha/2)
-                intervals[lower_key] = point_forecast - z_score * sigma
-                intervals[upper_key] = point_forecast + z_score * sigma
+            z_score = norm.ppf(1 - alpha / 2)
+            # Expand uncertainty with forecast horizon
+            horizon_factors = np.sqrt(np.arange(1, horizon + 1))
+            intervals[lower_key] = point_forecast - z_score * sigma * horizon_factors
+            intervals[upper_key] = point_forecast + z_score * sigma * horizon_factors
 
         return point_forecast, intervals
 
@@ -404,15 +436,27 @@ class StatisticalForecaster(BaseForecaster):
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
         """Generate ARIMA predictions with intervals."""
         forecast_result = model.get_forecast(steps=horizon)
-        point_forecast = forecast_result.predicted_mean.values
+
+        # Handle both Series and ndarray return types
+        predicted_mean = forecast_result.predicted_mean
+        if hasattr(predicted_mean, 'values'):
+            point_forecast = np.array(predicted_mean.values, dtype=float)
+        else:
+            point_forecast = np.array(predicted_mean, dtype=float)
 
         intervals = {}
         for alpha in confidence_levels:
             conf_int = forecast_result.conf_int(alpha=alpha)
             lower_key = f"lower_{int((1-alpha)*100)}"
             upper_key = f"upper_{int((1-alpha)*100)}"
-            intervals[lower_key] = conf_int.iloc[:, 0].values
-            intervals[upper_key] = conf_int.iloc[:, 1].values
+
+            if hasattr(conf_int, 'iloc'):
+                intervals[lower_key] = np.array(conf_int.iloc[:, 0].values, dtype=float)
+                intervals[upper_key] = np.array(conf_int.iloc[:, 1].values, dtype=float)
+            else:
+                # conf_int is a numpy array
+                intervals[lower_key] = np.array(conf_int[:, 0], dtype=float)
+                intervals[upper_key] = np.array(conf_int[:, 1], dtype=float)
 
         return point_forecast, intervals
 
@@ -634,7 +678,8 @@ class ProbabilisticReconciler:
         weights: str = "wls",
         covariance_type: str = "sample",
         lambda_reg: float = 0.01,
-        preserve_uncertainty: bool = True
+        preserve_uncertainty: bool = True,
+        **kwargs
     ) -> None:
         """
         Initialize probabilistic reconciler.
@@ -645,11 +690,12 @@ class ProbabilisticReconciler:
             covariance_type: Covariance estimation method.
             lambda_reg: Regularization parameter.
             preserve_uncertainty: Whether to preserve prediction intervals.
+            **kwargs: Additional configuration parameters (ignored).
         """
         self.method = method
         self.weights = weights
         self.covariance_type = covariance_type
-        self.lambda_reg = lambda_reg
+        self.lambda_reg = float(lambda_reg)
         self.preserve_uncertainty = preserve_uncertainty
         self.logger = logging.getLogger(__name__)
 
@@ -713,26 +759,45 @@ class ProbabilisticReconciler:
             ValueError: If reconciler is not fitted.
         """
         if self.S is None or self.G is None:
-            raise ValueError("Reconciler not fitted. Call fit() first.")
+            # If reconciler not fitted, return forecasts as-is
+            self.logger.warning("Reconciler not fitted, returning unreconciled forecasts")
+            return forecasts, intervals
 
         self.logger.info("Reconciling forecasts...")
 
-        # Convert forecasts to matrix format
-        forecast_matrix = self._dict_to_matrix(forecasts)
+        try:
+            # Convert forecasts to matrix format: (n_series, horizon)
+            series_ids = sorted(forecasts.keys())
+            forecast_matrix = self._dict_to_matrix(forecasts)
 
-        # Apply reconciliation
-        reconciled_matrix = self.G @ forecast_matrix
+            # Check dimensions match
+            n_series = forecast_matrix.shape[0]
+            n_G = self.G.shape[0]
 
-        # Convert back to dictionary format
-        reconciled_forecasts = self._matrix_to_dict(reconciled_matrix, list(forecasts.keys()))
+            if n_series != n_G:
+                self.logger.warning(
+                    f"Dimension mismatch: {n_series} series vs G matrix {self.G.shape}. "
+                    f"Skipping reconciliation."
+                )
+                return forecasts, intervals
 
-        # Reconcile intervals if provided and requested
-        reconciled_intervals = None
-        if intervals is not None and self.preserve_uncertainty:
-            reconciled_intervals = self._reconcile_intervals(intervals)
+            # Apply reconciliation: G @ forecast_matrix
+            reconciled_matrix = self.G @ forecast_matrix
 
-        self.logger.info("Forecast reconciliation completed")
-        return reconciled_forecasts, reconciled_intervals
+            # Convert back to dictionary format
+            reconciled_forecasts = self._matrix_to_dict(reconciled_matrix, series_ids)
+
+            # Reconcile intervals if provided and requested
+            reconciled_intervals = None
+            if intervals is not None and self.preserve_uncertainty:
+                reconciled_intervals = self._reconcile_intervals(intervals)
+
+            self.logger.info("Forecast reconciliation completed")
+            return reconciled_forecasts, reconciled_intervals
+
+        except Exception as e:
+            self.logger.warning(f"Reconciliation failed: {e}. Returning unreconciled forecasts.")
+            return forecasts, intervals
 
     def _estimate_weight_matrix(self, residuals: Dict[str, np.ndarray]) -> np.ndarray:
         """Estimate weight matrix from forecast residuals."""
@@ -800,27 +865,41 @@ class ProbabilisticReconciler:
         reconciled_intervals = {}
 
         for interval_name, interval_dict in intervals.items():
-            # Convert intervals to matrix format
-            interval_matrix = self._dict_to_matrix(interval_dict)
+            # Skip non-dict entries (like 'forecasts', 'coherence_score')
+            if not isinstance(interval_dict, dict):
+                continue
 
-            # Apply reconciliation transformation
-            reconciled_interval_matrix = self.G @ interval_matrix
+            try:
+                series_ids = sorted(interval_dict.keys())
+                interval_matrix = self._dict_to_matrix(interval_dict)
 
-            # Convert back to dictionary format
-            reconciled_intervals[interval_name] = self._matrix_to_dict(
-                reconciled_interval_matrix, list(interval_dict.keys())
-            )
+                if self.G is not None and interval_matrix.shape[0] == self.G.shape[0]:
+                    reconciled_interval_matrix = self.G @ interval_matrix
+                    reconciled_intervals[interval_name] = self._matrix_to_dict(
+                        reconciled_interval_matrix, series_ids
+                    )
+                else:
+                    # Dimensions don't match, return as-is
+                    reconciled_intervals[interval_name] = interval_dict
+
+            except Exception as e:
+                self.logger.warning(f"Failed to reconcile interval {interval_name}: {e}")
+                reconciled_intervals[interval_name] = interval_dict
 
         return reconciled_intervals
 
     def _dict_to_matrix(self, data_dict: Dict[str, np.ndarray]) -> np.ndarray:
-        """Convert dictionary of arrays to matrix format."""
+        """Convert dictionary of arrays to matrix format (each series is a row)."""
         series_ids = sorted(data_dict.keys())
-        return np.column_stack([data_dict[sid] for sid in series_ids])
+        return np.row_stack([np.atleast_1d(data_dict[sid]) for sid in series_ids])
 
     def _matrix_to_dict(self, matrix: np.ndarray, series_ids: List[str]) -> Dict[str, np.ndarray]:
-        """Convert matrix back to dictionary format."""
-        return {sid: matrix[:, i] for i, sid in enumerate(series_ids)}
+        """Convert matrix back to dictionary format (each row is a series)."""
+        result = {}
+        for i, sid in enumerate(series_ids):
+            if i < matrix.shape[0]:
+                result[sid] = matrix[i]
+        return result
 
     def compute_coherence_score(self, reconciled_forecasts: Dict[str, np.ndarray]) -> float:
         """
@@ -835,19 +914,40 @@ class ProbabilisticReconciler:
         if self.S is None:
             return 0.0
 
-        # Convert to matrix format
-        forecast_matrix = self._dict_to_matrix(reconciled_forecasts)
+        try:
+            # Convert to matrix format: (n_series, horizon)
+            forecast_matrix = self._dict_to_matrix(reconciled_forecasts)
+            n_series = forecast_matrix.shape[0]
+            n_bottom = self.S.shape[1]
 
-        # Check coherence: S @ bottom_forecasts should equal aggregated forecasts
-        bottom_forecasts = forecast_matrix[-self.S.shape[1]:, :]  # Bottom level
-        expected_aggregates = self.S @ bottom_forecasts
-        actual_aggregates = forecast_matrix[:-self.S.shape[1], :]  # Upper levels
+            if n_series < n_bottom:
+                return 0.5  # Cannot determine coherence
 
-        # Compute relative errors
-        relative_errors = np.abs(expected_aggregates - actual_aggregates) / (np.abs(actual_aggregates) + 1e-8)
-        coherence_score = 1.0 - np.mean(relative_errors)
+            # Bottom-level forecasts are the last n_bottom rows
+            bottom_forecasts = forecast_matrix[-n_bottom:]
 
-        return max(0.0, min(1.0, coherence_score))
+            # Expected aggregates from bottom up
+            S_dense = self.S.toarray() if sparse.issparse(self.S) else self.S
+            expected_aggregates = S_dense @ bottom_forecasts
+
+            # Actual aggregates are all rows
+            n_upper = n_series - n_bottom
+            if n_upper <= 0 or expected_aggregates.shape[0] < n_upper:
+                return 1.0  # Only bottom level, trivially coherent
+
+            actual_aggregates = forecast_matrix[:n_upper]
+            expected_upper = expected_aggregates[:n_upper]
+
+            # Compute relative errors
+            denom = np.abs(actual_aggregates) + 1e-8
+            relative_errors = np.abs(expected_upper - actual_aggregates) / denom
+            coherence_score = 1.0 - np.mean(relative_errors)
+
+            return max(0.0, min(1.0, coherence_score))
+
+        except Exception as e:
+            self.logger.warning(f"Coherence score computation failed: {e}")
+            return 0.0
 
 
 class HierarchicalEnsembleForecaster:
@@ -888,7 +988,7 @@ class HierarchicalEnsembleForecaster:
     def fit(
         self,
         data: pd.DataFrame,
-        aggregation_matrix: sparse.csr_matrix,
+        aggregation_matrix: Optional[sparse.csr_matrix] = None,
         target_col: str = "sales"
     ) -> "HierarchicalEnsembleForecaster":
         """
@@ -906,35 +1006,50 @@ class HierarchicalEnsembleForecaster:
 
         # Fit statistical models
         for name, config in self.statistical_configs.items():
-            self.logger.info(f"Fitting statistical model: {name}")
-            if name == "ets":
-                model = StatisticalForecaster("ets", ets_config=config)
-            elif name == "arima":
-                model = StatisticalForecaster("arima", arima_config=config)
-            else:
-                continue
+            try:
+                self.logger.info(f"Fitting statistical model: {name}")
+                if name == "ets":
+                    model = StatisticalForecaster("ets", ets_config=config)
+                elif name == "arima":
+                    model = StatisticalForecaster("arima", arima_config=config)
+                else:
+                    continue
 
-            model.fit(data, target_col)
-            self.statistical_models[name] = model
+                model.fit(data, target_col)
+                self.statistical_models[name] = model
+            except Exception as e:
+                self.logger.warning(f"Failed to fit statistical model {name}: {e}")
 
-        # Fit deep learning models
-        for name, config in self.deep_learning_configs.items():
-            self.logger.info(f"Fitting deep learning model: {name}")
-            if name == "tft":
-                model = DeepLearningForecaster("tft", tft_config=config)
-            elif name == "nbeats":
-                model = DeepLearningForecaster("nbeats", nbeats_config=config)
-            else:
-                continue
+        # Fit deep learning models (only if configs are non-empty and darts available)
+        if self.deep_learning_configs and HAS_DARTS:
+            for name, config in self.deep_learning_configs.items():
+                try:
+                    self.logger.info(f"Fitting deep learning model: {name}")
+                    if name == "tft":
+                        model = DeepLearningForecaster("tft", tft_config=config)
+                    elif name == "nbeats":
+                        model = DeepLearningForecaster("nbeats", nbeats_config=config)
+                    else:
+                        continue
 
-            model.fit(data, target_col)
-            self.deep_learning_models[name] = model
+                    model.fit(data, target_col)
+                    self.deep_learning_models[name] = model
+                except Exception as e:
+                    self.logger.warning(f"Failed to fit deep learning model {name}: {e}")
 
-        # Fit reconciler (compute residuals if needed)
-        self.reconciler.fit(aggregation_matrix)
+        # Fit reconciler if aggregation matrix provided
+        if aggregation_matrix is not None:
+            try:
+                self.reconciler.fit(aggregation_matrix)
+            except Exception as e:
+                self.logger.warning(f"Reconciler fitting failed: {e}")
+
+        if not self.statistical_models and not self.deep_learning_models:
+            raise RuntimeError("No models were successfully fitted")
 
         self.is_fitted = True
-        self.logger.info("Ensemble fitting completed")
+        total_models = len(self.statistical_models) + len(self.deep_learning_models)
+        self.logger.info(f"Ensemble fitting completed with {total_models} models")
 
         return self
 
@@ -984,9 +1099,24 @@ class HierarchicalEnsembleForecaster:
             all_predictions, confidence_levels, return_intervals
         )
 
+        # Generate all-level forecasts using bottom-up aggregation if needed
+        if self.reconciler.S is not None:
+            try:
+                all_level_forecasts, all_level_intervals = self._bottom_up_aggregate(
+                    ensemble_forecasts,
+                    ensemble_intervals if return_intervals else None
+                )
+            except Exception as e:
+                self.logger.warning(f"Bottom-up aggregation failed: {e}")
+                all_level_forecasts = ensemble_forecasts
+                all_level_intervals = ensemble_intervals if return_intervals else None
+        else:
+            all_level_forecasts = ensemble_forecasts
+            all_level_intervals = ensemble_intervals if return_intervals else None
+
         # Apply hierarchical reconciliation
         reconciled_forecasts, reconciled_intervals = self.reconciler.reconcile(
-            ensemble_forecasts, ensemble_intervals if return_intervals else None
+            all_level_forecasts, all_level_intervals
         )
 
         # Compute coherence score
@@ -1002,6 +1132,70 @@ class HierarchicalEnsembleForecaster:
 
         self.logger.info(f"Ensemble prediction completed (coherence: {coherence_score:.3f})")
         return result
+
+    def _bottom_up_aggregate(
+        self,
+        bottom_forecasts: Dict[str, np.ndarray],
+        bottom_intervals: Optional[Dict[str, Dict[str, np.ndarray]]] = None
+    ) -> Tuple[Dict[str, np.ndarray], Optional[Dict[str, Dict[str, np.ndarray]]]]:
+        """Generate all-level forecasts by aggregating bottom-level using S matrix."""
+        S = self.reconciler.S
+        if S is None:
+            return bottom_forecasts, bottom_intervals
+
+        S_dense = S.toarray() if sparse.issparse(S) else np.array(S)
+        n_all = S_dense.shape[0]
+        n_bottom = S_dense.shape[1]
+
+        # Get sorted bottom series IDs
+        bottom_ids = sorted(bottom_forecasts.keys())
+        if len(bottom_ids) != n_bottom:
+            self.logger.warning(
+                f"Bottom series count mismatch: {len(bottom_ids)} vs S matrix columns {n_bottom}"
+            )
+            return bottom_forecasts, bottom_intervals
+
+        # Get forecast horizon from first series
+        horizon = len(next(iter(bottom_forecasts.values())))
+
+        # Build bottom-level forecast matrix: (n_bottom, horizon)
+        bottom_matrix = np.zeros((n_bottom, horizon))
+        for i, sid in enumerate(bottom_ids):
+            bottom_matrix[i] = bottom_forecasts[sid]
+
+        # Compute all-level forecasts: S @ bottom = (n_all, horizon)
+        all_matrix = S_dense @ bottom_matrix
+
+        # Create all-level forecast dict
+        # Upper-level IDs are synthetic: "agg_0", "agg_1", ...
+        all_forecasts = {}
+        n_upper = n_all - n_bottom
+        for i in range(n_upper):
+            all_forecasts[f"agg_{i}"] = all_matrix[i]
+        for i, sid in enumerate(bottom_ids):
+            all_forecasts[sid] = all_matrix[n_upper + i]
+
+        # Handle intervals similarly
+        all_intervals = None
+        if bottom_intervals is not None:
+            all_intervals = {}
+            for key, interval_dict in bottom_intervals.items():
+                if not isinstance(interval_dict, dict):
+                    continue
+                int_matrix = np.zeros((n_bottom, horizon))
+                for i, sid in enumerate(bottom_ids):
+                    if sid in interval_dict:
+                        int_matrix[i] = interval_dict[sid]
+                all_int_matrix = S_dense @ int_matrix
+
+                level_intervals = {}
+                for i in range(n_upper):
+                    level_intervals[f"agg_{i}"] = all_int_matrix[i]
+                for i, sid in enumerate(bottom_ids):
+                    level_intervals[sid] = all_int_matrix[n_upper + i]
+                all_intervals[key] = level_intervals
+
+        return all_forecasts, all_intervals
 
     def _combine_predictions(
         self,

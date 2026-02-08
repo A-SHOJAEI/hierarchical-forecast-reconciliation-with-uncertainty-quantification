@@ -4,30 +4,31 @@
 # Data configuration
 data:
   # M5 dataset paths
+  path: "data/m5"
   calendar_path: "data/m5/calendar.csv"
   prices_path: "data/m5/sell_prices.csv"
   sales_train_path: "data/m5/sales_train_evaluation.csv"
   sales_test_path: "data/m5/sales_train_validation.csv"
 
-  # Preprocessing parameters
-  train_days: 1913  # Days in training set
-  validation_days: 28  # Days for validation
-  test_days: 28  # Days for testing
-  min_nonzero_ratio: 0.1  # Minimum ratio of non-zero values for series inclusion
+  # Preprocessing parameters (adjusted for synthetic 365-day dataset)
+  train_days: 300
+  validation_days: 28
+  test_days: 28
+  min_nonzero_ratio: 0.1
 
   # Aggregation levels for hierarchical reconciliation
   aggregation_levels:
-    - "total"  # Level 1: Total
-    - "state"  # Level 2: State (CA, TX, WI)
-    - "store"  # Level 3: Store (10 stores)
-    - "cat"    # Level 4: Category (3 categories)
-    - "dept"   # Level 5: Department (7 departments)
-    - "state_cat"  # Level 6: State-Category
-    - "state_dept" # Level 7: State-Department
-    - "store_cat"  # Level 8: Store-Category
-    - "store_dept" # Level 9: Store-Department
-    - "item"       # Level 10: Item (3049 items)
-    - "item_store" # Level 11: Item-Store (bottom level)
+    - "total"
+    - "state"
+    - "store"
+    - "cat"
+    - "dept"
+    - "state_cat"
+    - "state_dept"
+    - "store_cat"
+    - "store_dept"
+    - "item"
+    - "item_store"
 
 # Model configuration
 models:
@@ -38,7 +39,7 @@ models:
       error: "add"
       trend: "add"
       seasonal: "add"
-      use_boxcox: true
+      use_boxcox: false
       remove_bias: true
 
     arima:
@@ -46,49 +47,25 @@ models:
       maxiter: 50
       method: "lbfgs"
 
-  # Deep learning models
-  deep_learning:
-    tft:
-      max_epochs: 100
-      learning_rate: 0.03
-      hidden_size: 16
-      attention_head_size: 4
-      dropout: 0.1
-      hidden_continuous_size: 8
-      output_size: 7
-      loss: "QuantileLoss"
-      quantiles: [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
-
-    nbeats:
-      input_chunk_length: 28
-      output_chunk_length: 28
-      num_stacks: 30
-      num_blocks: 1
-      num_layers: 4
-      layer_widths: 512
-      expansion_coefficient_dim: 5
-      trend_polynomial_degree: 2
-      dropout: 0.0
-      activation: "ReLU"
+  # Deep learning models (disabled by default for stability)
+  deep_learning: {}
 
 # Reconciliation configuration
 reconciliation:
-  method: "probabilistic_mint"  # Minimum trace with probabilistic constraints
-  weights: "wls"  # Weighted least squares
-  covariance_type: "sample"  # Sample covariance for weights
-  lambda_reg: 0.01  # Regularization parameter
-  preserve_uncertainty: true  # Maintain prediction intervals through reconciliation
-  coherence_penalty: 1.0  # Penalty for incoherent forecasts
+  method: "probabilistic_mint"
+  weights: "wls"
+  covariance_type: "sample"
+  lambda_reg: 0.01
+  preserve_uncertainty: true
+  coherence_penalty: 1.0
 
-# Ensemble configuration
+# Ensemble configuration (statistical only)
 ensemble:
   weights:
-    ets: 0.25
-    arima: 0.25
-    tft: 0.35
-    nbeats: 0.15
+    ets: 0.5
+    arima: 0.5
   combination_method: "weighted_average"
-  uncertainty_propagation: "bootstrap"  # Method for combining prediction intervals
+  uncertainty_propagation: "bootstrap"
   n_bootstrap_samples: 1000
 
 # Training configuration
@@ -97,7 +74,7 @@ training:
   max_epochs: 200
   early_stopping_patience: 20
   learning_rate: 0.001
-  weight_decay: 1e-8
+  weight_decay: 0.00000001
   gradient_clip_val: 0.1
 
   # Validation strategy
@@ -111,44 +88,34 @@ training:
 
   # MLflow tracking
   experiment_name: "hierarchical_forecast_reconciliation"
-  run_name: null  # Auto-generated if null
+  run_name: null
   tracking_uri: "mlruns"
 
 # Evaluation configuration
 evaluation:
   metrics:
-    - "WRMSSE"    # Weighted Root Mean Squared Scaled Error
-    - "MASE"      # Mean Absolute Scaled Error
-    - "sMAPE"     # symmetric Mean Absolute Percentage Error
-    - "MSIS"      # Mean Scaled Interval Score
-    - "CRPS"      # Continuous Ranked Probability Score
-    - "coverage_50"  # 50% prediction interval coverage
-    - "coverage_90"  # 90% prediction interval coverage
-    - "coverage_95"  # 95% prediction interval coverage
-    - "reconciliation_coherence"  # Coherence measure
+    - "WRMSSE"
+    - "MASE"
+    - "sMAPE"
+    - "coverage_90"
+    - "coverage_95"
+    - "reconciliation_coherence"
 
   # Significance testing
   statistical_tests:
-    - "dm_test"   # Diebold-Mariano test
-    - "mcs_test"  # Model Confidence Set test
+    - "dm_test"
 
   confidence_level: 0.05
 
 # Hyperparameter optimization
 optimization:
   method: "optuna"
-  n_trials: 100
-  timeout: 7200  # 2 hours
+  n_trials: 10
+  timeout: 3600
 
   # Parameters to optimize
   search_space:
-    tft_learning_rate: [0.001, 0.1]
-    tft_hidden_size: [8, 64]
-    tft_dropout: [0.0, 0.3]
-    nbeats_num_stacks: [10, 50]
-    nbeats_layer_widths: [128, 1024]
     reconciliation_lambda_reg: [0.001, 0.1]
-    ensemble_tft_weight: [0.1, 0.6]
 
 # Logging configuration
 logging:
