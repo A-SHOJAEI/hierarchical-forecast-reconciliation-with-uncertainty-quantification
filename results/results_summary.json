@@ -1,0 +1,66 @@
+{
+  "experiment_name": "hierarchical_forecast_reconciliation",
+  "config": "default",
+  "status": "completed",
+  "timestamp": "2026-02-08T11:04:00",
+  "data": {
+    "dataset": "synthetic_m5",
+    "n_series": 490,
+    "n_hierarchy_levels": 11,
+    "train_days": 300,
+    "validation_days": 28,
+    "test_days": 28
+  },
+  "models": {
+    "ets": {
+      "fitted_series": 490,
+      "success_rate": 1.0,
+      "training_time_seconds": 18
+    },
+    "arima": {
+      "fitted_series": 490,
+      "success_rate": 1.0,
+      "training_time_seconds": 96
+    },
+    "ensemble": {
+      "ets_weight": 0.5,
+      "arima_weight": 0.5,
+      "combination_method": "weighted_average"
+    }
+  },
+  "reconciliation": {
+    "method": "probabilistic_mint",
+    "weights": "wls",
+    "lambda_reg": 0.01,
+    "preserve_uncertainty": true
+  },
+  "metrics": {
+    "WRMSSE": 1.7258955925524888,
+    "MASE": 3.012795004108675,
+    "sMAPE": 106.1490355493724,
+    "coverage_90": 0.33855685131195334,
+    "width_90": -3.223706810594279,
+    "interval_score_90": -1.7505165881973987,
+    "coverage_95": 0.3525510204081633,
+    "width_95": -3.8411822676766256,
+    "interval_score_95": -2.9669805362172683,
+    "coherence": 1.0
+  },
+  "analysis": {
+    "point_forecast_quality": "moderate",
+    "uncertainty_calibration": "needs_improvement",
+    "coherence_quality": "perfect",
+    "notes": [
+      "Metrics computed on synthetic M5-like data, not actual M5 competition data",
+      "WRMSSE of 1.726 indicates forecasts are 1.7x worse than naive seasonal baseline",
+      "Low coverage (33.9% vs target 90%) suggests interval calibration needs work",
+      "Perfect coherence (1.0) achieved through bottom-up aggregation before MinT reconciliation",
+      "Statistical ensemble (ETS+ARIMA) only - no deep learning models used"
+    ]
+  },
+  "artifacts": {
+    "config": "artifacts/config.json",
+    "metrics": "artifacts/metrics.json",
+    "mlflow_run": "mlruns/427400382649899158/749daf7dd28048dba5f8874ebe7d1021"
+  }
+}

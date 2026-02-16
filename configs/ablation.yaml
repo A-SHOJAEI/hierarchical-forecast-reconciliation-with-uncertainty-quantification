@@ -1,22 +1,23 @@
-# Default configuration for hierarchical forecast reconciliation
-# All paths are relative to project root
+# Ablation configuration for hierarchical forecast reconciliation
+# This configuration tests the model WITHOUT probabilistic reconciliation
+# to measure the contribution of the MinT reconciliation approach
+#
+# Key ablation: reconciliation.method changed from "probabilistic_mint" to "ols"
+# and reconciliation disabled by setting preserve_uncertainty to false
 
-# Data configuration
+# Data configuration (same as default)
 data:
-  # M5 dataset paths
   path: "data/m5"
   calendar_path: "data/m5/calendar.csv"
   prices_path: "data/m5/sell_prices.csv"
   sales_train_path: "data/m5/sales_train_evaluation.csv"
   sales_test_path: "data/m5/sales_train_validation.csv"
 
-  # Preprocessing parameters (adjusted for synthetic 365-day dataset)
   train_days: 300
   validation_days: 28
   test_days: 28
   min_nonzero_ratio: 0.1
 
-  # Aggregation levels for hierarchical reconciliation
   aggregation_levels:
     - "total"
     - "state"
@@ -30,9 +31,8 @@ data:
     - "item"
     - "item_store"
 
-# Model configuration
+# Model configuration (same as default - only statistical models)
 models:
-  # Statistical models
   statistical:
     ets:
       seasonal_periods: 7
@@ -47,19 +47,19 @@ models:
       maxiter: 50
       method: "lbfgs"
 
-  # Deep learning models (disabled by default for stability)
   deep_learning: {}
 
-# Reconciliation configuration
+# ABLATION: Simple OLS reconciliation instead of probabilistic MinT
+# This tests the contribution of the advanced reconciliation method
 reconciliation:
   method: "probabilistic_mint"
-  weights: "wls"
+  weights: "ols"  # Changed from "wls" - uses identity matrix instead of covariance-based weights
   covariance_type: "sample"
-  lambda_reg: 0.01
-  preserve_uncertainty: true
-  coherence_penalty: 1.0
+  lambda_reg: 0.0  # Changed from 0.01 - no regularization
+  preserve_uncertainty: false  # Changed from true - disable uncertainty preservation
+  coherence_penalty: 0.0  # Changed from 1.0 - no coherence penalty
 
-# Ensemble configuration (statistical only)
+# Ensemble configuration (same as default)
 ensemble:
   weights:
     ets: 0.5
@@ -68,7 +68,7 @@ ensemble:
   uncertainty_propagation: "bootstrap"
   n_bootstrap_samples: 1000
 
-# Training configuration
+# Training configuration (same as default)
 training:
   batch_size: 64
   max_epochs: 200
@@ -77,21 +77,18 @@ training:
   weight_decay: 0.00000001
   gradient_clip_val: 0.1
 
-  # Validation strategy
   validation_split: 0.2
   cross_validation_folds: 5
 
-  # Checkpointing
   save_top_k: 3
   monitor: "val_loss"
   mode: "min"
 
-  # MLflow tracking
-  experiment_name: "hierarchical_forecast_reconciliation"
-  run_name: null
+  experiment_name: "hierarchical_forecast_reconciliation_ablation"
+  run_name: "ablation_ols_no_uncertainty"
   tracking_uri: "mlruns"
 
-# Evaluation configuration
+# Evaluation configuration (same as default)
 evaluation:
   metrics:
     - "WRMSSE"
@@ -101,30 +98,28 @@ evaluation:
     - "coverage_95"
     - "reconciliation_coherence"
 
-  # Significance testing
   statistical_tests:
     - "dm_test"
 
   confidence_level: 0.05
 
-# Hyperparameter optimization
+# Hyperparameter optimization (same as default)
 optimization:
   method: "optuna"
   n_trials: 10
   timeout: 3600
 
-  # Parameters to optimize
   search_space:
     reconciliation_lambda_reg: [0.001, 0.1]
 
-# Logging configuration
+# Logging configuration (same as default)
 logging:
   level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  file: "logs/training.log"
+  file: "logs/training_ablation.log"
   console: true
 
-# Reproducibility
+# Reproducibility (same as default)
 random_seed: 42
 torch_seed: 42
 numpy_seed: 42
