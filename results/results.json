@@ -1,0 +1,47 @@
+{
+  "experiment": "hierarchical_forecast_reconciliation",
+  "dataset": "synthetic_m5",
+  "data": {
+    "n_series": 490,
+    "n_hierarchy_levels": 11,
+    "train_days": 300,
+    "validation_days": 28,
+    "test_days": 28
+  },
+  "models": {
+    "ets": {
+      "fitted_series": 490,
+      "success_rate": 1.0,
+      "training_time_seconds": 18
+    },
+    "arima": {
+      "fitted_series": 490,
+      "success_rate": 1.0,
+      "training_time_seconds": 96
+    },
+    "ensemble": {
+      "ets_weight": 0.5,
+      "arima_weight": 0.5,
+      "combination_method": "weighted_average"
+    }
+  },
+  "reconciliation": {
+    "method": "probabilistic_mint",
+    "weights": "wls",
+    "lambda_reg": 0.01,
+    "preserve_uncertainty": true
+  },
+  "metrics": {
+    "WRMSSE": 1.7259,
+    "MASE": 3.0128,
+    "sMAPE": 106.1490,
+    "coverage_90": 0.3386,
+    "width_90": -3.2237,
+    "interval_score_90": -1.7505,
+    "coverage_95": 0.3526,
+    "width_95": -3.8412,
+    "interval_score_95": -2.9670,
+    "coherence": 1.0
+  },
+  "status": "completed"
+}
