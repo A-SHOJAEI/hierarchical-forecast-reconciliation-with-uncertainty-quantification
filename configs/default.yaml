@@ -89,7 +89,7 @@ training:
   # MLflow tracking
   experiment_name: "hierarchical_forecast_reconciliation"
   run_name: null
-  tracking_uri: "mlruns"
+  tracking_uri: null
 
 # Evaluation configuration
 evaluation:
